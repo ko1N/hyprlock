@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <unordered_map>
 #include <any>
+#include <cstdint>
+#include <vector>
 
 struct SPreloadedAsset;
 class COutput;
@@ -35,6 +37,11 @@ class CImage : public IWidget {
     void         renderUpdate();
     void         onTimerUpdate();
     void         plantTimer();
+
+    void         onAnimationTimerUpdate();
+    void         plantAnimationTimer(uint32_t delayMs);
+    void         resetAnimationState();
+    void         initializeAnimationPlayback();
 
   private:
     AWP<CImage>                     m_self;
@@ -61,13 +68,25 @@ class CImage : public IWidget {
     size_t                          m_imageRevision = 0;
 
     ASP<CTimer>                     imageTimer;
+    ASP<CTimer>                     animationTimer;
 
-    Vector2D                        viewport;
-    std::string                     stringPort;
+    struct SAnimationFrame {
+        ASP<CTexture> texture;
+        uint32_t      durationMs = 0;
+    };
 
-    ResourceID                      resourceID        = 0;
-    bool                            m_pendingResource = false;
+    std::vector<SAnimationFrame> animationFrames;
+    uint32_t                     animationLoopCount     = 0;
+    uint32_t                     animationLoopsComplete = 0;
+    size_t                       animationFrameIndex    = 0;
+    bool                         animationInitialized   = false;
 
-    ASP<CTexture>                   asset = nullptr;
-    CShadowable                     shadow;
+    Vector2D                     viewport;
+    std::string                  stringPort;
+
+    ResourceID                   resourceID        = 0;
+    bool                         m_pendingResource = false;
+
+    ASP<CTexture>                asset = nullptr;
+    CShadowable                  shadow;
 };

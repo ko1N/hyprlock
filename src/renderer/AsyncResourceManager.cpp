@@ -1,6 +1,7 @@
 #include "AsyncResourceManager.hpp"
 
 #include "./resources/TextCmdResource.hpp"
+#include "./resources/AnimatedImageResource.hpp"
 #include "../helpers/Log.hpp"
 #include "../helpers/MiscFunctions.hpp"
 #include "../core/hyprlock.hpp"
@@ -78,7 +79,7 @@ ResourceID CAsyncResourceManager::requestImage(const std::string& path, size_t r
         return RESOURCEID;
     }
 
-    auto                                 resource = makeAtomicShared<CImageResource>(absolutePath(path, ""));
+    auto                                 resource = makeAtomicShared<CAnimatedImageResource>(absolutePath(path, ""));
     CAtomicSharedPointer<IAsyncResource> resourceGeneric{resource};
 
     Debug::log(TRACE, "Requesting image resource {} revision {} (resourceID: {})", path, revision, RESOURCEID, (uintptr_t)widget.get());
@@ -91,6 +92,13 @@ ASP<CTexture> CAsyncResourceManager::getAssetByID(size_t id) {
         return nullptr;
 
     return m_assets[id].texture;
+}
+
+std::optional<CAsyncResourceManager::SImageTimeline> CAsyncResourceManager::getImageTimelineByID(ResourceID id) const {
+    if (!m_imageTimelines.contains(id))
+        return std::nullopt;
+
+    return m_imageTimelines.at(id);
 }
 
 void CAsyncResourceManager::enqueueStaticAssets() {
@@ -220,6 +228,7 @@ void CAsyncResourceManager::unload(ASP<CTexture> texture) {
 
     if (preload->second.refs == 0) {
         Debug::log(TRACE, "Releasing resourceID: {}!", preload->first);
+        m_imageTimelines.erase(preload->first);
         m_assets.erase(preload->first);
     }
 }
@@ -232,6 +241,7 @@ void CAsyncResourceManager::unloadById(ResourceID id) {
 
     if (m_assets[id].refs == 0) {
         Debug::log(TRACE, "Releasing resourceID: {}!", id);
+        m_imageTimelines.erase(id);
         m_assets.erase(id);
     }
 }
@@ -313,36 +323,62 @@ void CAsyncResourceManager::onResourceFinished(ResourceID id) {
 
     Debug::log(TRACE, "Resource to texture id:{}", id);
 
-    const auto           texture = makeAtomicShared<CTexture>();
+    const auto SURFACETOTEXTURE = [id](const SP<CCairoSurface>& cairoSurface, const Vector2D& pixelSize) -> ASP<CTexture> {
+        const auto           texture       = makeAtomicShared<CTexture>();
+        const cairo_status_t SURFACESTATUS = (cairo_status_t)cairoSurface->status();
+        const auto           CAIROFORMAT   = cairo_image_surface_get_format(cairoSurface->cairo());
+        const GLint          glIFormat     = CAIROFORMAT == CAIRO_FORMAT_RGB96F ? GL_RGB32F : GL_RGBA;
+        const GLint          glFormat      = CAIROFORMAT == CAIRO_FORMAT_RGB96F ? GL_RGB : GL_RGBA;
+        const GLint          glType        = CAIROFORMAT == CAIRO_FORMAT_RGB96F ? GL_FLOAT : GL_UNSIGNED_BYTE;
 
-    const cairo_status_t SURFACESTATUS = (cairo_status_t)RESOURCE->m_asset.cairoSurface->status();
-    const auto           CAIROFORMAT   = cairo_image_surface_get_format(RESOURCE->m_asset.cairoSurface->cairo());
-    const GLint          glIFormat     = CAIROFORMAT == CAIRO_FORMAT_RGB96F ? GL_RGB32F : GL_RGBA;
-    const GLint          glFormat      = CAIROFORMAT == CAIRO_FORMAT_RGB96F ? GL_RGB : GL_RGBA;
-    const GLint          glType        = CAIROFORMAT == CAIRO_FORMAT_RGB96F ? GL_FLOAT : GL_UNSIGNED_BYTE;
+        if (SURFACESTATUS != CAIRO_STATUS_SUCCESS) {
+            Debug::log(ERR, "resourceID: {} invalid ({})", id, cairo_status_to_string(SURFACESTATUS));
+            texture->m_iType = TEXTURE_INVALID;
+            return texture;
+        }
 
-    if (SURFACESTATUS != CAIRO_STATUS_SUCCESS) {
-        Debug::log(ERR, "resourceID: {} invalid ({})", id, cairo_status_to_string(SURFACESTATUS));
-        texture->m_iType = TEXTURE_INVALID;
+        texture->m_vSize = pixelSize;
+        texture->allocate();
+
+        glBindTexture(GL_TEXTURE_2D, texture->m_iTexID);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        if (CAIROFORMAT != CAIRO_FORMAT_RGB96F) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+        }
+        glTexImage2D(GL_TEXTURE_2D, 0, glIFormat, pixelSize.x, pixelSize.y, 0, glFormat, glType, cairoSurface->data());
+
+        return texture;
+    };
+
+    SImageTimeline timeline;
+
+    if (const auto PANIMATED = dynamic_cast<CAnimatedImageResource*>(RESOURCE.get()); PANIMATED) {
+        timeline.animated  = PANIMATED->isAnimated();
+        timeline.loopCount = PANIMATED->loopCount();
+        timeline.frames.reserve(PANIMATED->frames().size());
+
+        for (const auto& frame : PANIMATED->frames()) {
+            if (!frame.cairoSurface)
+                continue;
+
+            const auto texture = SURFACETOTEXTURE(frame.cairoSurface, frame.cairoSurface->size());
+            timeline.frames.emplace_back(SImageTimelineFrame{.texture = texture, .durationMs = frame.durationMs});
+        }
     }
 
-    texture->m_vSize = RESOURCE->m_asset.pixelSize;
-    texture->allocate();
-
-    glBindTexture(GL_TEXTURE_2D, texture->m_iTexID);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    if (CAIROFORMAT != CAIRO_FORMAT_RGB96F) {
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_BLUE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
+    if (timeline.frames.empty()) {
+        const auto texture = SURFACETOTEXTURE(RESOURCE->m_asset.cairoSurface, RESOURCE->m_asset.pixelSize);
+        timeline.frames.emplace_back(SImageTimelineFrame{.texture = texture, .durationMs = 0});
     }
-    glTexImage2D(GL_TEXTURE_2D, 0, glIFormat, texture->m_vSize.x, texture->m_vSize.y, 0, glFormat, glType, RESOURCE->m_asset.cairoSurface->data());
 
-    m_assets[id].texture = texture;
+    m_assets[id].texture = timeline.frames[0].texture;
+    m_imageTimelines[id] = timeline;
 
     for (const auto& widget : WIDGETS) {
         if (auto w = widget.lock())
-            w->onAssetUpdate(id, texture);
+            w->onAssetUpdate(id, timeline.frames[0].texture);
     }
 
     g_pHyprlock->renderAllOutputs();

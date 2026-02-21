@@ -11,6 +11,10 @@
 #include <hyprgraphics/resource/resources/ImageResource.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
 
+#include <cstdint>
+#include <optional>
+#include <vector>
+
 class CAsyncResourceManager {
 
   public:
@@ -38,25 +42,37 @@ class CAsyncResourceManager {
         size_t        refs = 0;
     };
 
+    struct SImageTimelineFrame {
+        ASP<CTexture> texture;
+        uint32_t      durationMs = 0;
+    };
+
+    struct SImageTimeline {
+        std::vector<SImageTimelineFrame> frames;
+        uint32_t                         loopCount = 0;
+        bool                             animated  = false;
+    };
+
     CAsyncResourceManager()  = default;
     ~CAsyncResourceManager() = default;
 
     ResourceID requestText(const CTextResource::STextResourceData& params, const AWP<IWidget>& widget);
     // Same as requestText but substitute the text with what launching sh -c request.text returns.
-    ResourceID    requestTextCmd(const CTextResource::STextResourceData& params, size_t revision, const AWP<IWidget>& widget);
-    ResourceID    requestImage(const std::string& path, size_t revision, const AWP<IWidget>& widget);
+    ResourceID                    requestTextCmd(const CTextResource::STextResourceData& params, size_t revision, const AWP<IWidget>& widget);
+    ResourceID                    requestImage(const std::string& path, size_t revision, const AWP<IWidget>& widget);
 
-    ASP<CTexture> getAssetByID(ResourceID id);
+    ASP<CTexture>                 getAssetByID(ResourceID id);
+    std::optional<SImageTimeline> getImageTimelineByID(ResourceID id) const;
 
-    void          unload(ASP<CTexture> resource);
-    void          unloadById(ResourceID id);
+    void                          unload(ASP<CTexture> resource);
+    void                          unloadById(ResourceID id);
 
-    void          enqueueStaticAssets();
-    void          enqueueScreencopyFrames();
-    void          screencopyToTexture(const CScreencopyFrame& scFrame);
-    void          gatherInitialResources(wl_display* display);
+    void                          enqueueStaticAssets();
+    void                          enqueueScreencopyFrames();
+    void                          screencopyToTexture(const CScreencopyFrame& scFrame);
+    void                          gatherInitialResources(wl_display* display);
 
-    bool          checkIdPresent(ResourceID id);
+    bool                          checkIdPresent(ResourceID id);
 
   private:
     // Returns whether or not the id was already requested.
@@ -80,6 +96,7 @@ class CAsyncResourceManager {
 
     // not shared between threads
     std::unordered_map<ResourceID, SPreloadedTexture> m_assets;
+    std::unordered_map<ResourceID, SImageTimeline>    m_imageTimelines;
     std::vector<UP<CScreencopyFrame>>                 m_scFrames;
     // shared between threads
     std::mutex                                                                                              m_resourcesMutex;

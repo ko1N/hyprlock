@@ -5,6 +5,7 @@
 #include "../../helpers/Log.hpp"
 #include "../../helpers/MiscFunctions.hpp"
 #include "../../config/ConfigDataValues.hpp"
+#include <algorithm>
 #include <cmath>
 #include <hyprlang.hpp>
 #include <hyprutils/math/Vector2D.hpp>
@@ -22,6 +23,11 @@ static void onTimer(AWP<CImage> ref) {
         PIMAGE->onTimerUpdate();
         PIMAGE->plantTimer();
     }
+}
+
+static void onAnimationTimer(AWP<CImage> ref) {
+    if (auto PIMAGE = ref.lock(); PIMAGE)
+        PIMAGE->onAnimationTimerUpdate();
 }
 
 void CImage::onTimerUpdate() {
@@ -75,6 +81,89 @@ void CImage::plantTimer() {
         imageTimer = g_pHyprlock->addTimer(std::chrono::seconds(reloadTime), [REF = m_self](auto, auto) { onTimer(REF); }, nullptr, false);
 }
 
+void CImage::plantAnimationTimer(uint32_t delayMs) {
+    if (animationTimer) {
+        animationTimer->cancel();
+        animationTimer.reset();
+    }
+
+    if (delayMs == 0)
+        delayMs = 10;
+
+    animationTimer = g_pHyprlock->addTimer(std::chrono::milliseconds(delayMs), [REF = m_self](auto, auto) { onAnimationTimer(REF); }, nullptr, false);
+}
+
+void CImage::resetAnimationState() {
+    if (animationTimer) {
+        animationTimer->cancel();
+        animationTimer.reset();
+    }
+
+    animationFrames.clear();
+    animationLoopCount     = 0;
+    animationLoopsComplete = 0;
+    animationFrameIndex    = 0;
+    animationInitialized   = false;
+}
+
+void CImage::initializeAnimationPlayback() {
+    resetAnimationState();
+
+    if (!g_asyncResourceManager || resourceID == 0)
+        return;
+
+    const auto TIMELINE = g_asyncResourceManager->getImageTimelineByID(resourceID);
+    if (!TIMELINE.has_value()) {
+        animationInitialized = true;
+        return;
+    }
+
+    animationLoopCount = TIMELINE->loopCount;
+    animationFrames.reserve(TIMELINE->frames.size());
+    for (const auto& frame : TIMELINE->frames) {
+        if (!frame.texture)
+            continue;
+        animationFrames.emplace_back(SAnimationFrame{.texture = frame.texture, .durationMs = frame.durationMs});
+    }
+
+    animationInitialized = true;
+
+    if (animationFrames.empty())
+        return;
+
+    animationFrameIndex = 0;
+    asset               = animationFrames[0].texture;
+
+    if (animationFrames.size() <= 1)
+        return;
+
+    plantAnimationTimer(std::max(animationFrames[0].durationMs, 10U));
+}
+
+void CImage::onAnimationTimerUpdate() {
+    if (animationFrames.size() <= 1)
+        return;
+
+    size_t nextFrame = animationFrameIndex + 1;
+    if (nextFrame >= animationFrames.size()) {
+        if (animationLoopCount != 0 && animationLoopsComplete + 1 >= animationLoopCount)
+            return;
+
+        animationLoopsComplete++;
+        nextFrame = 0;
+    }
+
+    animationFrameIndex = nextFrame;
+    asset               = animationFrames[animationFrameIndex].texture;
+    imageFB.destroyBuffer();
+    firstRender = true;
+
+    if (animationFrames.size() > 1)
+        plantAnimationTimer(std::max(animationFrames[animationFrameIndex].durationMs, 10U));
+
+    g_pHyprlock->renderAllOutputs();
+}
+
 void CImage::configure(const std::unordered_map<std::string, std::any>& props, const SP<COutput>& pOutput) {
     reset();
 
@@ -121,13 +210,15 @@ void CImage::reset() {
         imageTimer.reset();
     }
 
+    resetAnimationState();
+
     if (g_pHyprlock->m_bTerminate)
         return;
 
     imageFB.destroyBuffer();
 
-    if (asset && reloadTime > -1) // Don't unload asset if it's a static image
-        g_asyncResourceManager->unload(asset);
+    if (resourceID != 0 && reloadTime > -1) // Don't unload asset if it's a static image
+        g_asyncResourceManager->unloadById(resourceID);
 
     asset             = nullptr;
     m_pendingResource = false;
@@ -141,6 +232,9 @@ bool CImage::draw(const SRenderData& data) {
 
     if (!asset)
         asset = g_asyncResourceManager->getAssetByID(resourceID);
+
+    if (asset && !animationInitialized)
+        initializeAnimationPlayback();
 
     if (!asset)
         return true;
@@ -218,12 +312,15 @@ void CImage::onAssetUpdate(ResourceID id, ASP<CTexture> newAsset) {
         g_asyncResourceManager->unload(newAsset);
         Debug::log(ERR, "New image asset has an invalid texture!");
     } else {
-        g_asyncResourceManager->unload(asset);
+        if (resourceID != 0)
+            g_asyncResourceManager->unloadById(resourceID);
         imageFB.destroyBuffer();
 
         asset       = newAsset;
         resourceID  = id;
         firstRender = true;
+
+        initializeAnimationPlayback();
     }
 }
 
